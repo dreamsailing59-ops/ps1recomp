@@ -381,7 +381,7 @@ int main(int argc, char **argv) {
                 return 1;
             }
 
-            fprintf(out, "#include \"ps1_runtime.h\"\n\nvoid game_entry(CPU_Context* ctx) {\n");
+            fprintf(out, "#include \"../src/ps1_runtime.h\"\n\nvoid game_entry(CPU_Context* ctx) {\n");
 
             uint32_t current_pc = game_exe.pc;
             // Safety: Ensure the entry point is actually within the destination range
@@ -399,29 +399,40 @@ int main(int argc, char **argv) {
                 uint32_t pc = current_pc + (i * 4);
                 uint32_t phys_offset = buffer_offset + (i * 4);
 
-                // Check if we are still inside the buffer
                 if (phys_offset >= game_exe.file_size) break;
 
                 uint32_t instr = *(uint32_t*)&game_exe.body[phys_offset];
-                
-                // Lookahead for delay slot, but stay in bounds
                 uint32_t next = 0;
                 if (phys_offset + 4 < game_exe.file_size) {
                     next = *(uint32_t*)&game_exe.body[phys_offset + 4];
                 }
 
                 fprintf(out, "block_%08X:\n", pc);
+                // Call the recompiler and tell it to write to 'out'
                 recompile_instruction(out, pc, instr, next);
                 
-                // Skip the delay slot if we just processed a branch
+                // Check if instr is a branch/jump to skip the delay slot i++
                 uint8_t op = instr >> 26;
-                if (op >= 0x01 && op <= 0x07 || op == 0x14 || op == 0x15) {
+                if ((op >= 0x01 && op <= 0x07) || op == 0x02 || op == 0x03) {
                     i++; 
                 }
             }
 
             fprintf(out, "}\n");
             fclose(out);
+            printf("Successfully recompiled to recompiled_game.c\n");
+            fprintf(out, "\n// The Dispatcher handles indirect jumps (like JR RA)\n");
+            fprintf(out, "void dispatcher(CPU_Context* ctx) {\n");
+            fprintf(out, "    while(1) {\n");
+            fprintf(out, "        switch(ctx->pc) {\n");
+            fprintf(out, "            case 0x%08X: game_entry(ctx); break;\n", game_exe.pc);
+            fprintf(out, "            default:\n");
+            fprintf(out, "                printf(\"Jumped to unknown address 0x%%08X\\n\", ctx->pc);\n");
+            fprintf(out, "                return;\n");
+            fprintf(out, "        }\n");
+            fprintf(out, "    }\n}\n");
+
+            fclose(out); // Now close the file
             printf("Successfully recompiled to recompiled_game.c\n");
         }
     }
