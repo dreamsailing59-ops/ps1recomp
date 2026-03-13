@@ -29,9 +29,17 @@ If the output is successful. You should get
 ```
 Successfully recompiled to recompiled_game.c
 ```
+After that. Type "cd .." and then type the following command
+```
+gcc runner.c build/recompiled_game.c -o ps1_game_native
+```
+Again. Replace `game.bin` with the actual path/name of your `.bin` file.
+
+Finally. Simply run "./ps1_game_native". You then see a wild spam of each instruction being run in the terminal.
 
 ## Notes
 - Ensure the `.bin` has a matching `.cue` file; the tool relies on the `.cue` metadata.
 - The recompiler is still incomplete. So the generated C code of the game may contain a lot of missing opcodes. (As we have already tried it with Crash Bandicoot)
 - The runtime is still unfinished.
+- After running `./ps1_game_native` the game will continue to execute every instruction with no end. And the program itself will remain stuck on PC: `0x80011A18`. It is a bug that will fixed in future updates.
 - The project itself is still experimental and a lot of features still need to be added.
