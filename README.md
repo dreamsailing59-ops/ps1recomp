@@ -35,7 +35,7 @@ gcc runner.c build/recompiled_game.c -o ps1_game_native
 ```
 Again. Replace `game.bin` with the actual path/name of your `.bin` file.
 
-Finally. Simply run "./ps1_game_native". You then see a wild spam of each instruction being run in the terminal.
+Finally. Simply run `./ps1_game_native`. You then see a wild spam of each instruction being run in the terminal.
 
 ## Notes
 - Ensure the `.bin` has a matching `.cue` file; the tool relies on the `.cue` metadata.
