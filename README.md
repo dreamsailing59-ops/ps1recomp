@@ -23,7 +23,12 @@ ps1recomp.exe game.bin
 ```
 Replace `game.bin` with the actual name of your `.bin` file.
 
+After running the command. You should get something like:
+```
+Found file: SYSTEM.CNF;1
+BOOT = cdrom:\SCUS_949.00;1
+```
+
 ## Notes
 - Ensure the `.bin` has a matching `.cue` file; the tool relies on the `.cue` metadata.
-- Generated C code is intended for portability but may require platform-specific toolchain adjustments for best results.
-- For large images the conversion and build can take significant time and disk space.
+- The project itself is still experimental and a lot of features still need to be added.
