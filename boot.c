@@ -10,6 +10,8 @@ and reads ISO9660 starting from that track's sector.
 #include <stdint.h>
 #include <string.h>
 #include <ctype.h>
+#include "loader.h"
+#include "recompiler.h"
 
 #define SECTOR_SIZE 2352
 #define DATA_OFFSET 24
@@ -211,6 +213,31 @@ static int parse_cue_mode2_2352(const char *cue_path, char **out_bin_path, uint3
     return 0;
 }
 
+void extract_file(FILE *iso_f, uint32_t lba, uint32_t size, uint32_t track_start, const char *out_name) {
+    // Calculate absolute offset in the .bin
+    uint64_t offset = ((uint64_t)lba + (uint64_t)track_start) * SECTOR_SIZE + DATA_OFFSET;
+    FSEEK_64(iso_f, offset, SEEK_SET);
+    
+    FILE *out_f = fopen(out_name, "wb");
+    if (!out_f) return;
+
+    uint8_t buffer[2048];
+    uint32_t remaining = size;
+    while (remaining > 0) {
+        uint32_t to_read = (remaining > 2048) ? 2048 : remaining;
+        fread(buffer, 1, to_read, iso_f);
+        fwrite(buffer, 1, to_read, out_f);
+        remaining -= to_read;
+        if (remaining > 0) {
+            offset += SECTOR_SIZE;
+            FSEEK_64(iso_f, offset, SEEK_SET);
+        }
+    }
+    fclose(out_f);
+}
+
+#include "loader.h" // MAKE SURE THIS IS AT THE VERY TOP OF boot.c
+
 int main(int argc, char **argv) {
     if (argc != 2) {
         fprintf(stderr, "Usage: %s <image.bin|image.cue>\n", argv[0]);
@@ -222,15 +249,14 @@ int main(int argc, char **argv) {
     char *bin_path = NULL;
     uint32_t track_start_sector = 0;
 
-    /* detect .cue (case-insensitive) */
     const char *ext = strrchr(input_path, '.');
     if (ext && (strcasecmp(ext, ".cue") == 0 || strcasecmp(ext, ".CUE") == 0)) {
         int r = parse_cue_mode2_2352(input_path, &bin_path, &track_start_sector);
         if (r != 0) {
-            fprintf(stderr, "Failed to parse .cue or MODE2/2352 track not found (err=%d)\n", r);
+            fprintf(stderr, "Failed to parse .cue (err=%d)\n", r);
             return 2;
         }
-        iso_path = bin_path; /* use resolved bin path */
+        iso_path = bin_path;
     }
 
     FILE *f = fopen(iso_path, "rb");
@@ -240,78 +266,27 @@ int main(int argc, char **argv) {
         return 3;
     }
 
-    /* Seek to Primary Volume Descriptor within the MODE2/2352 track.
-        If we parsed a .cue, track_start_sector is the INDEX 01 offset (in sectors) within the bin.
-        Otherwise track_start_sector is 0 and behavior matches original program.
-    */
     uint64_t pvd_offset = ((uint64_t)track_start_sector + (uint64_t)PVD_SECTOR) * (uint64_t)SECTOR_SIZE + (uint64_t)DATA_OFFSET;
-    if (FSEEK_64(f, pvd_offset, SEEK_SET) != 0) {
-        perror("fseek");
-        fclose(f);
-        free(bin_path);
-        return 4;
-    }
+    FSEEK_64(f, pvd_offset, SEEK_SET);
+    
     unsigned char pvd[SECTOR_SIZE];
     if (fread(pvd, 1, SECTOR_SIZE, f) != SECTOR_SIZE) {
-        fprintf(stderr, "Failed to read PVD\n");
         fclose(f);
         free(bin_path);
         return 5;
     }
 
-    if (pvd[0] != 1 || memcmp(pvd + 1, "CD001", 5) != 0) {
-        fprintf(stderr, "Not a valid ISO9660 Primary Volume Descriptor\n");
-        fclose(f);
-        free(bin_path);
-        return 6;
-    }
-
-    /* Root directory record starts at offset 156 in PVD */
     unsigned char *root = pvd + 156;
-    int root_len = root[0];
-    if (root_len < 34) {
-        fprintf(stderr, "Invalid root directory record\n");
-        fclose(f);
-        free(bin_path);
-        return 7;
-    }
-
     uint32_t root_lba = le32(root + 2);
     uint32_t root_size = le32(root + 10);
 
-    /* Read root directory extent */
-    uint64_t root_offset = (uint64_t)root_lba * SECTOR_SIZE + (uint64_t)track_start_sector * SECTOR_SIZE;
-    /* Note: root_lba is relative to the start of the track; we have already positioned at track start for PVD,
-        but the file is a single .bin file; compute absolute byte offset within file as (track_start_sector + root_lba)*SECTOR_SIZE.
-        However since we didn't reposition to track start, use absolute: (root_lba + track_start_sector)*SECTOR_SIZE.
-    */
-    root_offset =
-        ((uint64_t)root_lba + (uint64_t)track_start_sector) * SECTOR_SIZE
-        + DATA_OFFSET;
-    
-    if (FSEEK_64(f, root_offset, SEEK_SET) != 0) {
-        perror("fseek root");
-        fclose(f);
-        free(bin_path);
-        return 8;
-    }
+    uint64_t root_offset = ((uint64_t)root_lba + (uint64_t)track_start_sector) * SECTOR_SIZE + DATA_OFFSET;
+    FSEEK_64(f, root_offset, SEEK_SET);
 
     unsigned char *dirbuf = malloc(root_size);
-    if (!dirbuf) {
-        fprintf(stderr, "Out of memory\n");
-        fclose(f);
-        free(bin_path);
-        return 9;
-    }
-    if (fread(dirbuf, 1, root_size, f) != root_size) {
-        fprintf(stderr, "Failed to read root directory data\n");
-        free(dirbuf);
-        fclose(f);
-        free(bin_path);
-        return 10;
-    }
+    fread(dirbuf, 1, root_size, f);
 
-    /* Scan directory records to find SYSTEM.CNF */
+    /* Pass 1: Find SYSTEM.CNF */
     uint32_t pos = 0;
     int found = 0;
     uint32_t sf_lba = 0, sf_size = 0;
@@ -319,127 +294,141 @@ int main(int argc, char **argv) {
     while (pos < root_size) {
         unsigned char dr_len = dirbuf[pos];
         if (dr_len == 0) {
-            /* advance to next sector boundary */
             uint32_t next = ((pos / SECTOR_SIZE) + 1) * SECTOR_SIZE;
             if (next <= pos) break;
             pos = next;
             continue;
         }
-        if (pos + dr_len > root_size) break;
-        unsigned char file_flags = dirbuf[pos + 25];
         unsigned char file_id_len = dirbuf[pos + 32];
         unsigned char *file_id = dirbuf + pos + 33;
 
-        /* skip '.' and '..' entries */
-        if (!(file_id_len == 1 && (file_id[0] == 0 || file_id[0] == 1))) {
-            if (id_matches(file_id, file_id_len, "SYSTEM.CNF")) {
-                /* found */
-                printf("Found file: %.*s\n", (int)file_id_len, file_id);
-                sf_lba = le32(dirbuf + pos + 2);
-                sf_size = le32(dirbuf + pos + 10);
-                found = 1;
-                break;
-            }
+        if (id_matches(file_id, file_id_len, "SYSTEM.CNF")) {
+            sf_lba = le32(dirbuf + pos + 2);
+            sf_size = le32(dirbuf + pos + 10);
+            found = 1;
+            break;
         }
-
         pos += dr_len;
     }
 
     if (!found) {
-        fprintf(stderr, "SYSTEM.CNF not found in root directory\n");
-        free(dirbuf);
-        fclose(f);
-        free(bin_path);
+        fprintf(stderr, "SYSTEM.CNF not found\n");
         return 11;
     }
 
-    /* Read SYSTEM.CNF content (limit to reasonable size) */
-    uint64_t sf_offset =
-        ((uint64_t)sf_lba + (uint64_t)track_start_sector) * SECTOR_SIZE
-        + DATA_OFFSET;
-    
-    if (FSEEK_64(f, sf_offset, SEEK_SET) != 0) {
-        perror("fseek system.cnf");
-        free(dirbuf);
-        fclose(f);
-        free(bin_path);
-        return 12;
-    }
+    /* Read SYSTEM.CNF */
+    uint64_t sf_offset = ((uint64_t)sf_lba + (uint64_t)track_start_sector) * SECTOR_SIZE + DATA_OFFSET;
+    FSEEK_64(f, sf_offset, SEEK_SET);
+    char *cnf_data = malloc(sf_size + 1);
+    fread(cnf_data, 1, sf_size, f);
+    cnf_data[sf_size] = '\0';
 
-    size_t toread = sf_size;
-    if (toread == 0) {
-        fprintf(stderr, "SYSTEM.CNF has zero size\n");
-        free(dirbuf);
-        fclose(f);
-        free(bin_path);
-        return 13;
-    }
-
-    unsigned char *data = malloc(toread + 1);
-    if (!data) {
-        fprintf(stderr, "Out of memory\n");
-        free(dirbuf);
-        fclose(f);
-        free(bin_path);
-        return 14;
-    }
-    if (fread(data, 1, toread, f) != toread) {
-        fprintf(stderr, "Failed to read SYSTEM.CNF\n");
-        free(data);
-        free(dirbuf);
-        fclose(f);
-        free(bin_path);
-        return 15;
-    }
-    data[toread] = '\0'; /* ensure NUL-terminated */
-
-    /* Parse lines to find BOOT line */
-    char *p = (char *)data;
-    char *end = (char *)data + toread;
-    int printed = 0;
-    while (p < end) {
-        char *line_start = p;
-        char *line_end = p;
-        while (line_end < end && *line_end != '\n' && *line_end != '\r') line_end++;
-        size_t linelen = line_end - line_start;
-        char *line = malloc(linelen + 1);
-        if (!line) break;
-        memcpy(line, line_start, linelen);
-        line[linelen] = '\0';
-        /* advance p past this line (skip possible CRLF) */
-        p = line_end;
-        while (p < end && (*p == '\n' || *p == '\r')) p++;
-
-        /* trim and check */
+    /* Parse BOOT line and find EXE name */
+    char exe_name[32] = {0};
+    char *line = strtok(cnf_data, "\r\n");
+    while (line) {
         char *s = line;
         trim_left_inplace(&s);
-        trim_right(s);
-        /* check if starts with "BOOT" (case-insensitive) */
-        if (strlen(s) >= 4 && tolower((unsigned char)s[0]) == 'b' &&
-            tolower((unsigned char)s[1]) == 'o' &&
-            tolower((unsigned char)s[2]) == 'o' &&
-            tolower((unsigned char)s[3]) == 't') {
-            /* print the line as-is (trimmed) */
-            printf("%s\n", s);
-            printed = 1;
-            free(line);
+        if (strncasecmp(s, "BOOT", 4) == 0) {
+            char *start = strstr(s, "cdrom:\\");
+            if (start) {
+                start += 7;
+                char *end_ptr = strchr(start, ';');
+                if (!end_ptr) end_ptr = strchr(start, ' ');
+                if (end_ptr) {
+                    strncpy(exe_name, start, end_ptr - start);
+                } else {
+                    strcpy(exe_name, start);
+                }
+            }
             break;
         }
-        free(line);
+        line = strtok(NULL, "\r\n");
     }
 
-    if (!printed) {
-        fprintf(stderr, "BOOT line not found in SYSTEM.CNF\n");
-        free(data);
-        free(dirbuf);
-        fclose(f);
-        free(bin_path);
-        return 16;
+    if (exe_name[0] == '\0') {
+        fprintf(stderr, "Could not find EXE name in SYSTEM.CNF\n");
+        return 17;
     }
 
-    free(data);
+    /* Pass 2: Find the EXE on disc */
+    found = 0;
+    pos = 0;
+    while (pos < root_size) {
+        unsigned char dr_len = dirbuf[pos];
+        if (dr_len == 0) {
+            uint32_t next = ((pos / SECTOR_SIZE) + 1) * SECTOR_SIZE;
+            pos = next; continue;
+        }
+        unsigned char file_id_len = dirbuf[pos + 32];
+        unsigned char *file_id = dirbuf + pos + 33;
+        if (id_matches(file_id, file_id_len, exe_name)) {
+            sf_lba = le32(dirbuf + pos + 2);
+            sf_size = le32(dirbuf + pos + 10);
+            found = 1; break;
+        }
+        pos += dr_len;
+    }
+    
+    if (found) {
+        extract_file(f, sf_lba, sf_size, track_start_sector, "extracted.exe");
+        
+        PSX_Exe game_exe;
+        if (load_psx_exe("extracted.exe", &game_exe) == 0) {
+            FILE* out = fopen("recompiled_game.c", "w");
+            if (!out) {
+                perror("Could not open output file");
+                return 1;
+            }
+
+            fprintf(out, "#include \"ps1_runtime.h\"\n\nvoid game_entry(CPU_Context* ctx) {\n");
+
+            uint32_t current_pc = game_exe.pc;
+            // Safety: Ensure the entry point is actually within the destination range
+            if (current_pc < game_exe.dest_vaddr) {
+                fprintf(stderr, "Error: Entry point is outside of EXE range\n");
+                return 19;
+            }
+
+            uint32_t buffer_offset = current_pc - game_exe.dest_vaddr;
+            uint32_t instructions_count = game_exe.file_size / 4;
+
+            printf("Recompiling %u instructions...\n", instructions_count);
+
+            for (uint32_t i = 0; i < instructions_count; i++) {
+                uint32_t pc = current_pc + (i * 4);
+                uint32_t phys_offset = buffer_offset + (i * 4);
+
+                // Check if we are still inside the buffer
+                if (phys_offset >= game_exe.file_size) break;
+
+                uint32_t instr = *(uint32_t*)&game_exe.body[phys_offset];
+                
+                // Lookahead for delay slot, but stay in bounds
+                uint32_t next = 0;
+                if (phys_offset + 4 < game_exe.file_size) {
+                    next = *(uint32_t*)&game_exe.body[phys_offset + 4];
+                }
+
+                fprintf(out, "block_%08X:\n", pc);
+                recompile_instruction(out, pc, instr, next);
+                
+                // Skip the delay slot if we just processed a branch
+                uint8_t op = instr >> 26;
+                if (op >= 0x01 && op <= 0x07 || op == 0x14 || op == 0x15) {
+                    i++; 
+                }
+            }
+
+            fprintf(out, "}\n");
+            fclose(out);
+            printf("Successfully recompiled to recompiled_game.c\n");
+        }
+    }
+
+    free(cnf_data);
     free(dirbuf);
     fclose(f);
-    free(bin_path);
+    if (bin_path) free(bin_path);
     return 0;
 }
